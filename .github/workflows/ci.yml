@@ -3,9 +3,118 @@ on: [pull_request, push]
 name: CI
 
 jobs:
+  # Check shell scripts
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - name: ShellCheck
         uses: azohra/shell-linter@v0.3.0
+
+  # Build common base images containing shared utilities
+  build_base:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - "16.04"
+          - "18.04"
+          - "20.04"
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 2
+
+    - name: Login to GHCR (for publishing)
+      uses: docker/login-action@v1
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Enable docker experimental features (--squash)
+      run: |
+        sudo bash -c 'echo { \"cgroup-parent\": \"/actions_job\", \"experimental\": true } > /etc/docker/daemon.json && systemctl restart docker.service && cat /etc/docker/daemon.json'
+
+
+    - name: Setup docker layer caching
+      uses: satackey/action-docker-layer-caching@v0.0.11
+      continue-on-error: true
+      with:
+        key: base-${{ matrix.version }}-{hash}
+
+    - name: Republish upstream ubuntu:${{ matrix.version }} image from dockerhub to ghcr
+      run: |
+        docker pull ubuntu:${{ matrix.version }}
+        docker tag ubuntu:${{ matrix.version }} ghcr.io/${{ github.repository }}/ubuntu:${{ matrix.version }}
+        docker push ghcr.io/${{ github.repository }}/ubuntu:${{ matrix.version }}
+
+    - name: Build base docker image
+      run: |
+        docker build \
+        --tag ghcr.io/${{ github.repository }}/base:${{ matrix.version }} \
+        --build-arg "VERSION=${{ matrix.version }}" \
+        --squash \
+        -f docker/Dockerfile.common docker
+        docker push ghcr.io/${{ github.repository }}/base:${{ matrix.version }}
+
+  build_images:
+    runs-on: ubuntu-latest
+    needs: build_base
+
+    # Standard env flags (override in matrix if required)
+    env:
+      CPP: 1
+      DYLIB: 1
+      STD: 1
+      RUN: 1
+
+    # List images for building here (with env overrides)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - target: aarch64-linux-android
+        - target: aarch64-unknown-linux-gnu
+        - target: aarch64-unknown-linux-musl
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 2
+
+    - name: Login to GHCR (for publishing)
+      uses: docker/login-action@v1
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup docker layer caching
+      uses: satackey/action-docker-layer-caching@v0.0.11
+      continue-on-error: true
+      with:
+        key: image-${{ matrix.target }}-{hash}
+
+    - name: Enable docker experimental features (--squash)
+      run: |
+        sudo bash -c 'echo { \"cgroup-parent\": \"/actions_job\", \"experimental\": true } > /etc/docker/daemon.json && systemctl restart docker.service && cat /etc/docker/daemon.json'
+
+
+    - name: Build ${{ matrix.target }} image
+      run: docker build \
+        --tag ghcr.io/${{ github.repository }}/${{ matrix.target }}:${GITHUB_SHA::8} \
+        --squash \
+        -f docker/Dockerfile.${{ matrix.target }} docker
+
+    # TODO: run image tests here
+
+    # TODO: correctly publish tags to match cross versions
+    - name: Publish ${{ matrix.target }} image to ghcr
+      run: |
+        docker push ghcr.io/${{ github.repository }}/${{ matrix.target }}:${GITHUB_SHA::8}
+        docker tag ghcr.io/${{ github.repository }}/${{ matrix.target }}:${GITHUB_SHA::8} ghcr.io/${{ github.repository }}/${{ matrix.target }}:latest
+        docker push ghcr.io/${{ github.repository }}/${{ matrix.target }}:latest
